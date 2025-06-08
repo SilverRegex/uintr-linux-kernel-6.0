@@ -92,6 +92,8 @@ void switch_uintr_finish(struct task_struct *next);
 
 void uintr_free(struct task_struct *task);
 
+void upid_shared_mem_init(void);
+
 #else /* !CONFIG_X86_USER_INTERRUPTS */
 
 static inline void uintr_destroy_uitt_ctx(struct mm_struct *mm) {}
@@ -109,6 +111,14 @@ static inline void switch_uintr_finish(struct task_struct *next) {}
 
 static inline void uintr_free(struct task_struct *task) {}
 
+void upid_shared_mem_init(void) {}
+
 #endif /* CONFIG_X86_USER_INTERRUPTS */
+
+#define UPID_LINUX_MEM_SIZE  0x1000  // 4KB
+#define UPID_SHARED_MEM_SIZE 0x2000
+#define UPID_BLOCK_SIZE 64
+#define UPID_SHARED_MEM_PHYS_ADDR   (uint64_t)(0x41ffe000)
+#define MAX_UPID_BLOCKS (UPID_LINUX_MEM_SIZE / UPID_BLOCK_SIZE)
 
 #endif /* _ASM_X86_UINTR_H */

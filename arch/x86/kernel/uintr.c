@@ -17,6 +17,7 @@
 #include <linux/syscalls.h>
 #include <linux/task_work.h>
 #include <linux/uaccess.h>
+#include <linux/io.h>
 
 #include <asm/apic.h>
 #include <asm/fpu/api.h>
@@ -69,10 +70,106 @@ inline bool is_uintr_task(struct task_struct *t)
 	return(is_uintr_receiver(t) || is_uintr_sender(t));
 }
 
+
+static void *upid_shared_mem_start = 0;
+#define upid_linux_mem_start upid_shared_mem_start
+static bool upid_initialized = false;
+
+// 简单的位图分配器
+static bool used_upid_blocks[MAX_UPID_BLOCKS] = {false};
+static DEFINE_SPINLOCK(upid_lock); // 在文件顶部添加
+
+void upid_shared_mem_init(void) {
+	// pgprot_t prot = PAGE_KERNEL;  // 可改为 PAGE_KERNEL_NOCACHE 如果需要非缓存
+    // int ret;
+	// struct vm_struct *vma;
+	static struct resource *upid_mem_res;
+
+	upid_mem_res = request_mem_region(UPID_SHARED_MEM_PHYS_ADDR, UPID_SHARED_MEM_SIZE, "UPID shared mem");
+	if (!upid_mem_res) {
+		pr_err("jailhouse: request_mem_region failed for hypervisor "
+			   "memory.\n");
+		return;
+	}
+
+	// __get_vm_area_caller(UPID_SHARED_MEM_SIZE, VM_IOREMAP, UPID_SHARED_MEM_VIRT_ADDR, UPID_SHARED_MEM_VIRT_ADDR + UPID_SHARED_MEM_SIZE + PAGE_SIZE, __builtin_return_address(0));
+
+	// if (!vma) {
+	// 	release_mem_region(upid_mem_res->start, resource_size(upid_mem_res));
+	// 	pr_err("Failed to allocate vm_struct for UPID shared memory\n");
+	// 	return;
+	// }
+
+    // 映射物理地址到自定义虚拟地址
+    // ret = ioremap_page_range(UPID_SHARED_MEM_VIRT_ADDR, UPID_SHARED_MEM_VIRT_ADDR + UPID_SHARED_MEM_SIZE, UPID_SHARED_MEM_PHYS_ADDR, prot);
+	upid_shared_mem_start = ioremap(UPID_SHARED_MEM_PHYS_ADDR, UPID_SHARED_MEM_SIZE);
+    if (!upid_shared_mem_start) {
+		// vunmap(vma->addr);
+		release_mem_region(upid_mem_res->start, resource_size(upid_mem_res));
+        pr_err("Failed to map 0x%llx\n", UPID_SHARED_MEM_PHYS_ADDR);
+    }
+	else {
+		pr_info("Mapped phys 0x%llx -> virt %px\n", UPID_SHARED_MEM_PHYS_ADDR, upid_shared_mem_start);
+		upid_initialized = true;
+	}
+}
+
+// 分配函数
+void* alloc_uintr_upid(void) {
+	unsigned long flags;
+	size_t i = 0;
+	void *ret = NULL;
+
+	if (!upid_initialized) {
+		return kzalloc(sizeof(struct uintr_upid), GFP_KERNEL);
+	}
+
+	spin_lock_irqsave(&upid_lock, flags);
+    for (; i < MAX_UPID_BLOCKS; i++) {
+        if (!used_upid_blocks[i]) {
+            used_upid_blocks[i] = true;
+            ret = (void*)(upid_shared_mem_start + i * UPID_BLOCK_SIZE);
+			memset(ret, 0, UPID_BLOCK_SIZE);
+			break;
+        }
+    }
+	spin_unlock_irqrestore(&upid_lock, flags);
+    return ret; // 没有可用空间
+}
+
+// 释放函数
+void free_uintr_upid(void* ptr) {
+	unsigned long flags;
+	size_t index;
+
+	if (!upid_initialized) {
+		kfree(ptr);
+		return;
+	}
+
+    index = (ptr - upid_shared_mem_start) / UPID_BLOCK_SIZE;
+    
+    // 检查指针是否在有效范围内
+    if (ptr < upid_shared_mem_start || ptr >= upid_shared_mem_start + UPID_LINUX_MEM_SIZE) {
+        return;
+    }
+    
+    // 检查是否对齐
+    if ((ptr - upid_shared_mem_start) % UPID_BLOCK_SIZE != 0) {
+        return;
+    }
+
+	spin_lock_irqsave(&upid_lock, flags);
+    if (index < MAX_UPID_BLOCKS) {
+        used_upid_blocks[index] = false;
+    }
+	spin_unlock_irqrestore(&upid_lock, flags);
+}
+
 static void free_upid(struct uintr_upid_ctx *upid_ctx)
 {
 	put_task_struct(upid_ctx->task);
-	kfree(upid_ctx->upid);
+	free_uintr_upid(upid_ctx->upid);
 	upid_ctx->upid = NULL;
 	kfree(upid_ctx);
 }
@@ -114,7 +211,8 @@ static struct uintr_upid_ctx *alloc_upid(void)
 	if (!upid_ctx)
 		return NULL;
 
-	upid = kzalloc(sizeof(*upid), GFP_KERNEL);
+	// upid = kzalloc(sizeof(*upid), GFP_KERNEL);
+	upid = alloc_uintr_upid();
 
 	if (!upid) {
 		kfree(upid_ctx);
@@ -219,12 +317,45 @@ static int uvecfd_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+uint64_t uintr_mem_offset(void)
+{
+	if (!upid_initialized) {
+		return 0;
+	}
+	return (uint64_t)upid_shared_mem_start - UPID_SHARED_MEM_PHYS_ADDR;
+}
+
+#define UINTR_GET_UPID_PHYS_ADDR _IOR('u', 1, u64)
+
+static long uintrfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct uvecfd_ctx *uvecfd_ctx = file->private_data;
+	u64 __user *upid_addr = (u64 __user *)arg;  // 用户空间指针
+	u64 virt_addr, phys_addr;
+	
+    switch (cmd) {
+    case UINTR_GET_UPID_PHYS_ADDR: {
+        if (!uvecfd_ctx->upid_ctx)
+            return -EINVAL;  // 检查数据结构是否有效
+            
+		virt_addr = (u64) uvecfd_ctx->upid_ctx->upid;
+		phys_addr = virt_addr - uintr_mem_offset();
+		if (copy_to_user(upid_addr, &phys_addr, sizeof(phys_addr)))
+            return -EFAULT;  // 拷贝失败
+        return 0;
+    }
+    default:
+        return -ENOTTY;  // 未知命令
+    }
+}
+
 static const struct file_operations uvecfd_fops = {
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo	= uvecfd_show_fdinfo,
 #endif
 	.release	= uvecfd_release,
 	.llseek		= noop_llseek,
+	.unlocked_ioctl	= uintrfd_ioctl,
 };
 
 /*
@@ -294,7 +425,8 @@ static void free_uitt_entry(struct uintr_uitt_ctx *uitt_ctx, unsigned int entry)
 	pr_debug("send: Freeing UITTE entry %d for uitt_ctx=%lx\n",
 		 entry, (unsigned long)uitt_ctx);
 
-	put_upid_ref(uitt_ctx->r_upid_ctx[entry]);
+	if (uitt_ctx->r_upid_ctx[entry])
+		put_upid_ref(uitt_ctx->r_upid_ctx[entry]);
 
 	mutex_lock(&uitt_ctx->uitt_lock);
 	memset(&uitt_ctx->uitt[entry], 0, sizeof(struct uintr_uitt_entry));
@@ -457,6 +589,13 @@ bool uintr_check_uitte_valid(struct uintr_uitt_ctx *uitt_ctx, unsigned int entry
 	return !!test_bit(entry, (unsigned long *)uitt_ctx->uitt_mask);
 }
 
+static struct uintr_upid nimbos_upid = {
+    .nc.status = 0, // ON
+    .nc.nv = 41,     // Notification vector
+    .nc.ndst = 126,   // Notification destination
+    .puir = 0,         // Posted user interrupt requests
+};
+
 /* TODO: Fix unregister flow. Also all modifications to the uitte should be under a single lock */
 static int do_uintr_unregister_sender(struct uintr_uitt_ctx *uitt_ctx, unsigned int entry)
 {
@@ -514,6 +653,59 @@ static bool uintr_is_receiver_active(struct uintr_upid_ctx *upid_ctx)
 {
 	return upid_ctx->receiver_active;
 }
+
+int raw_uintr_register_sender(u64 upid_addr, u8 uvec, bool from_nimbos)
+{
+	struct uintr_uitt_entry *uitte = NULL;
+	struct uintr_uitt_ctx *uitt_ctx;
+	struct task_struct *t = current;
+	int entry;
+	int ret;
+
+	if (from_nimbos) {
+		pr_info("registering sender from nimbos, upid_addr=%lx\n", upid_addr);
+		upid_addr = upid_addr + uintr_mem_offset();
+	}
+	else {
+		upid_addr = (u64)&nimbos_upid;
+	}
+
+	ret = uintr_init_sender(t);
+	if (ret)
+		return ret;
+
+	uitt_ctx = t->mm->context.uitt_ctx;
+
+	BUILD_BUG_ON(UINTR_MAX_UITT_NR < 1);
+
+	entry = find_first_zero_bit((unsigned long *)uitt_ctx->uitt_mask,
+				    UINTR_MAX_UITT_NR);
+	if (entry >= UINTR_MAX_UITT_NR)
+		return -ENOSPC;
+
+	set_bit(entry, (unsigned long *)uitt_ctx->uitt_mask);
+
+	mutex_lock(&uitt_ctx->uitt_lock);
+
+	uitte = &uitt_ctx->uitt[entry];
+	pr_debug("send: sender=%d receiver in nimbos UITTE entry %d address %px\n",
+		 current->pid, entry, uitte);
+	
+	/* Program the UITT entry */
+	uitte->user_vec = uvec;
+	uitte->target_upid_addr = upid_addr;
+	uitte->valid = 1;
+
+	// uitt_ctx->r_upid_ctx[entry] = get_upid_ref(upid_ctx);
+	uitt_ctx->r_upid_ctx[entry] = NULL;
+
+	mutex_unlock(&uitt_ctx->uitt_lock);
+
+	if (!is_uintr_sender(t))
+		uintr_set_sender_msrs(t);
+
+	return entry;
+} 
 
 static int do_uintr_register_sender(u64 uvec, struct uintr_upid_ctx *upid_ctx)
 {
@@ -714,7 +906,7 @@ SYSCALL_DEFINE1(uintr_ipi_fd, unsigned int, flags)
 /*
  * sys_uintr_register_sender - setup user inter-processor interrupt sender.
  */
-SYSCALL_DEFINE2(uintr_register_sender, int, uvecfd, unsigned int, flags)
+SYSCALL_DEFINE2(uintr_register_sender, int64_t, uvecfd, unsigned int, flags)
 {
 	//struct uintr_uitt_ctx *uitt_ctx;
 	//struct uintr_sender_info *s_info;
@@ -723,12 +915,25 @@ SYSCALL_DEFINE2(uintr_register_sender, int, uvecfd, unsigned int, flags)
 	struct file *uvec_f;
 	struct fd f;
 	int ret = 0;
+	bool from_nimbos = false;
 
 	if (!cpu_feature_enabled(X86_FEATURE_UINTR))
 		return -ENOSYS;
 
-	if (flags)
-		return -EINVAL;
+	// if (flags)
+	// 	return -EINVAL;
+	if (flags) {
+		printk(KERN_WARNING "uintr_register_sender: flags %x\n", flags);
+		if ((~flags) & (1<<9)) {
+			return -EINVAL;
+		}
+		from_nimbos = flags & (1<<10);
+		flags &= 0xff;
+		if ((flags & 0x3f) != flags) {
+			return -EINVAL;
+		}
+		return raw_uintr_register_sender(uvecfd, flags, from_nimbos);
+	}
 
 	f = fdget(uvecfd);
 	uvec_f = f.file;
